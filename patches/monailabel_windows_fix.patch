@@ -1,0 +1,69 @@
+--- a/monailabel/datastore/local.py
++++ b/monailabel/datastore/local.py
+@@ add_image: sanitize filename for Windows (colons illegal in filenames)
+
+     def add_image(self, image_id: str, image_filename: str, image_info: Dict[str, Any]) -> str:
+         id, image_ext = self._to_id(os.path.basename(image_filename))
+         if not image_id:
+             image_id = id
+
++        # Sanitize only the filename (not the key) — colons are illegal on Windows
++        import re
++        safe_id = re.sub(r'[\\/*?:"<>|]', "_", image_id).strip()
++
+         logger.info(f"Adding Image: {image_id} => {image_filename}")
+-        name = self._filename(image_id, image_ext)
++        name = self._filename(safe_id, image_ext)
+         dest = os.path.realpath(os.path.join(self._datastore.image_path(), name))
+
+@@ get_image_uri: sanitize + fallback to DICOM folder for CBCT studies
+
+-    def get_image_uri(self, image_id: str) -> str:
+-        obj = self._datastore.objects.get(image_id)
+-        name = self._filename(image_id, obj.image.ext) if obj else ""
+-        return str(os.path.realpath(os.path.join(self._datastore.image_path(), name))) if obj else ""
++    def get_image_uri(self, image_id: str) -> str:
++        import re
++        safe_id = re.sub(r'[\\/*?:"<>|]', "_", image_id).strip()
++
++        # 1. Try original key
++        obj = self._datastore.objects.get(image_id)
++        if not obj and safe_id != image_id:
++            # 2. Try sanitized key (key derived from filename after restart)
++            obj = self._datastore.objects.get(safe_id)
++
++        if obj:
++            name = self._filename(safe_id, obj.image.ext)
++            return str(os.path.realpath(os.path.join(self._datastore.image_path(), name)))
++
++        # 3. Scan disk for matching file (uploaded file not yet in objects dict)
++        image_dir = self._datastore.image_path()
++        for ext in [".nii.gz", ".nii", ".nrrd"]:
++            candidate = os.path.realpath(os.path.join(image_dir, safe_id + ext))
++            if os.path.exists(candidate):
++                return candidate
++
++        # 4. Fallback: return studies folder if it contains DICOM files
++        if os.path.isdir(image_dir):
++            try:
++                has_dicom = any(f.lower().endswith(".dcm") for f in os.listdir(image_dir))
++                if has_dicom:
++                    return str(os.path.realpath(image_dir))
++            except OSError:
++                pass
++
++        return ""
+
+--- CONTEXT ---
+Applies to: monailabel==0.8.5, Python 3.10
+File: E:\monailabel-env-310\lib\site-packages\monailabel\datastore\local.py
+
+Problem 1: 3D Slicer sends image IDs like "1: 3D CBCT Image Set" which contain
+colons — illegal characters in Windows filenames. This caused FileNotFoundError
+on add_image and wrong path resolution in get_image_uri.
+
+Problem 2: After server restart, datastore re-derives keys from sanitized
+filenames, creating a mismatch with the original image IDs sent by Slicer.
+
+Problem 3: CBCT DICOM studies in the studies folder were not found because
+the local datastore only scans for NIfTI/NRRD extensions, not .dcm files.
